@@ -22,6 +22,7 @@ import com.google.common.base.Preconditions;
 import org.apache.calcite.prepare.RelOptTableImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
+import org.apache.calcite.runtime.CalciteContextException;
 import org.apache.calcite.sql.validate.SelectScope;
 import org.apache.calcite.sql.validate.SqlNameMatcher;
 import org.apache.calcite.sql.validate.SqlQualified;
@@ -34,14 +35,20 @@ import org.apache.calcite.sql.validate.SqlValidatorScope.Resolve;
 import org.apache.calcite.sql.validate.SqlValidatorScope.ResolvedImpl;
 import org.apache.calcite.sql.validate.SqlValidatorTable;
 import org.apache.calcite.sql.SqlOperatorTable;
+import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlCharStringLiteral;
+import org.apache.calcite.sql.SqlDataTypeSpec;
 import org.apache.calcite.sql.SqlFunction;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlJoin;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlNumericLiteral;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.SqlWithItem;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.calcite.schema.CalciteTable;
@@ -51,6 +58,8 @@ import org.apache.impala.catalog.BuiltinsDb;
 import org.apache.impala.catalog.FeTable;
 import org.apache.impala.catalog.FeView;
 import org.apache.impala.catalog.Type;
+import org.apache.impala.common.UnsupportedFeatureException;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -93,6 +102,15 @@ public class ImpalaSqlValidatorImpl extends SqlValidatorImpl {
   public RelDataType deriveType(
       SqlValidatorScope scope,
       SqlNode operand) {
+    if (operand instanceof SqlDataTypeSpec) {
+      SqlDataTypeSpec spec = (SqlDataTypeSpec) operand;
+      // Impala allows the type uuid, e.g.
+      // "SELECT CAST('12345678-1234-5678-1234-567812345678' AS UUID)"
+      if (spec.getTypeName().names.get(0).toLowerCase().equals("uuid")) {
+        throw new CalciteContextException("", new UnsupportedFeatureException(
+            "Uuid type not supported yet."));
+      }
+    }
     // This code is needed because Calcite treats all integer literals (except
     // BIGINT) as Integers, but Impala needs the finer granularity of smaller
     // integers (e.g. tinyint)
@@ -160,6 +178,27 @@ public class ImpalaSqlValidatorImpl extends SqlValidatorImpl {
     }
   }
 
+  @Override public void validateWithItem(SqlWithItem withItem) {
+    // Impala supports the case (for better or for worse) where the number of
+    // columns in the with clause definition do not match the number of columns
+    // being selected out (e.g. "with t(c1) as (select c1, c2 from ...)")
+    // Calcite will throw its own exception, but we need to throw an
+    // UnsupportedFeatureException so this can be run by the original planner.
+    SqlNodeList columnList = withItem.columnList;
+    if (columnList != null) {
+      final RelDataType rowType = getValidatedNodeType(withItem.query);
+      final int fieldCount = rowType.getFieldCount();
+      if (columnList.size() != fieldCount) {
+        throw new CalciteContextException("", new UnsupportedFeatureException(
+            "Number of columns in with clause must match number of query columns"));
+      }
+    }
+    // After the above check, the Impala "with" validation is in sync with the
+    // Calcite "with" validation, so we can just call the Calcite version of
+    // validateWithItem().
+    super.validateWithItem(withItem);
+  }
+
   @Override public void validateCall(
       SqlCall call,
       SqlValidatorScope scope) {
@@ -180,6 +219,7 @@ public class ImpalaSqlValidatorImpl extends SqlValidatorImpl {
   protected void validateSelect(
       SqlSelect select,
       RelDataType targetRowType) {
+    throwIfValuesClauseBugPresent(select.getFrom());
     // A select node is visited here, Notify the current phase of the alias
     // corrector object to handle any gathering or correction needed.
     // Since this method is called from a visitor, other "enter" methods
@@ -241,5 +281,96 @@ public class ImpalaSqlValidatorImpl extends SqlValidatorImpl {
     ViewAliasCorrector.ViewAttemptAliasCorrection c =
         (ViewAliasCorrector.ViewAttemptAliasCorrection) viewAliasCorrector_;
     return c.hasAliasIssue();
+  }
+
+  /**
+   * IMPALA-14943:
+   * throwIfValuesClauseBugPresent looks for a very explicit set of criteria for
+   * an existing bug in Calcite. At this point, it is unknown if this is a general
+   * bug in Calcite or a bug specific to the Impala implementation of the values
+   * clause.
+   * The circumstances that cause the bug are:
+   * 1) Table has to be a "values" clause
+   * 2) Values clause has an alias
+   * 3) The row in the values clause contains only one column
+   * 4) The first row in the values clause contains a column alias.
+   *
+   * An example of a problematic query is:
+   * "select tmp.val from (values(0 as val), (1)) as tmp"
+   *
+   * The code here will throw an exception when this happens, causing the query
+   * to fallback to the original Impala planner.
+   *
+   * The bug in Calcite was found in version 1.41 in AliasNamespace.validateImpl(). There
+   * is an "if" clause at line 93 which replaces the wrong alias when the number of
+   * columns in the row is 1.
+   */
+  private void throwIfValuesClauseBugPresent(SqlNode fromNode) {
+    // Make sure from node is an aliased SqlBasicCall
+    if (fromNode instanceof SqlBasicCall) {
+      throwIfValuesClauseBugPresentInternal((SqlBasicCall) fromNode);
+    }
+    if (fromNode instanceof SqlJoin) {
+      SqlJoin joinNode = (SqlJoin) fromNode;
+      if (joinNode.getLeft() instanceof SqlJoin) {
+        throwIfValuesClauseBugPresent(joinNode.getLeft());
+      }
+      if (joinNode.getLeft() instanceof SqlBasicCall) {
+        throwIfValuesClauseBugPresentInternal((SqlBasicCall) joinNode.getLeft());
+      }
+      if (joinNode.getRight() instanceof SqlJoin) {
+        throwIfValuesClauseBugPresent(joinNode.getRight());
+      }
+      if (joinNode.getRight() instanceof SqlBasicCall) {
+        throwIfValuesClauseBugPresentInternal((SqlBasicCall) joinNode.getRight());
+      }
+    }
+  }
+
+  private void throwIfValuesClauseBugPresentInternal(SqlBasicCall fromCall) {
+    // Make sure from node is an aliased SqlBasicCall
+    if (fromCall.getOperator().getKind() != SqlKind.AS) {
+      return;
+    }
+    SqlNode tableNode = fromCall.operand(0);
+
+    // Check that the table is a values clause
+    if (!(tableNode instanceof SqlBasicCall)) {
+      return;
+    }
+    SqlBasicCall tableBasicCall = (SqlBasicCall) tableNode;
+    if (tableBasicCall.getOperator().getKind() != SqlKind.VALUES) {
+      return;
+    }
+
+    // Verify that the first operand of values is a "row"
+    SqlNode firstRowNode = tableBasicCall.operand(0);
+    if (!(firstRowNode instanceof SqlBasicCall)) {
+      return;
+    }
+    SqlBasicCall firstRowCall = (SqlBasicCall) firstRowNode;
+    if (firstRowCall.getOperator().getKind() != SqlKind.ROW) {
+      return;
+    }
+
+    // Bug only exists if there is one operand in the row
+    if (firstRowCall.operandCount() != 1) {
+      return;
+    }
+
+    // If the first (only) column is an alias, this query has the bug, so we
+    // throw an exception.
+    SqlNode columnNode = firstRowCall.operand(0);
+    if (!(columnNode instanceof SqlBasicCall)) {
+      return;
+    }
+
+    SqlBasicCall columnCall = (SqlBasicCall) columnNode;
+    if (columnCall.getOperator().getKind() != SqlKind.AS) {
+      return;
+    }
+
+    throw new CalciteContextException("", new UnsupportedFeatureException(
+        "IMPALA-14943: Validation issue in Calcite, falling back to original planner."));
   }
 }
