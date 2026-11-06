@@ -439,6 +439,10 @@ though some of them might not be necessary. The exclusions are sorted alphabetic
                 <exclude>com/amazonaws/services/workspacesthinclient/**</exclude>
                 <exclude>com/amazonaws/services/workspacesweb/**</exclude>
                 <exclude>com/amazonaws/services/xray/**</exclude>
+                <exclude>io/netty/**</exclude>
+                <exclude>META-INF/maven/io.netty/**</exclude>
+                <exclude>META-INF/io.netty.versions.properties</exclude>
+                <exclude>META-INF/native/*netty*</exclude>
                 <exclude>models/**</exclude>
               </excludes>
             </filter>
